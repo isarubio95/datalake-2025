@@ -1,0 +1,24 @@
+﻿telemetry:
+  enabled: false
+
+storage:
+  mysql:
+    mysql_db:
+      username: { env: DAGSTER_MYSQL_USERNAME }
+      password: { env: DAGSTER_MYSQL_PASSWORD }
+      hostname: { env: DAGSTER_MYSQL_HOST }
+      db_name:  { env: DAGSTER_MYSQL_DB }
+      port:     { env: DAGSTER_MYSQL_PORT }
+
+run_coordinator:
+  module: dagster._core.run_coordinator
+  class: DefaultRunCoordinator
+
+run_monitoring:
+  start_timeout_seconds: 120
+
+sensors:
+  use_threads: true
+
+schedules:
+  use_threads: true
