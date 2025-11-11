@@ -130,8 +130,8 @@ def register_one_table_op(name: str, config: RegisterConfig) -> None:
         log.warning(f"[{name}] No se encontró ningún .metadata.json en {md_prefix}. Omitiendo esta tabla.")
         return # Salta esta tabla y continúa con la siguiente
 
-    metadata_file_uri = f"s3://{bucket}/{latest_meta}"
-    table_location = f"s3://{bucket}/{base}"
+    metadata_file_uri = f"s3a://{bucket}/{latest_meta}"
+    table_location = f"s3a://{bucket}/{base}"
 
     # Spark para registrar en el catálogo Iceberg (Hive)
     from pyspark.sql import SparkSession
@@ -142,42 +142,47 @@ def register_one_table_op(name: str, config: RegisterConfig) -> None:
     builder = (
         SparkSession.builder
         .appName(f"register-{name}")
+        .master("local[*]")
+        .config("spark.jars.packages", 
+                "org.apache.iceberg:iceberg-spark-runtime-3.3_2.12:1.4.3,"
+                "org.apache.hadoop:hadoop-aws:3.3.2,"
+                "com.amazonaws:aws-java-sdk-bundle:1.12.262")
         .config(f"spark.sql.catalog.{catalog_name}", "org.apache.iceberg.spark.SparkCatalog")
         .config(f"spark.sql.catalog.{catalog_name}.type", "hive")
         .config(f"spark.sql.catalog.{catalog_name}.uri", config.metastore_uri)
+        .config("spark.sql.warehouse.dir", f"s3a://{bucket}/Data/")
         .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+        .config("spark.hadoop.hive.metastore.uris", "thrift://metastore:9083")
+        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+        .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "true")
+        .config("spark.hadoop.fs.s3a.aws.credentials.provider", "com.amazonaws.auth.DefaultAWSCredentialsProviderChain")
     )
     if config.aws_region:
         builder = builder.config("spark.hadoop.aws.region", config.aws_region)
 
     spark = builder.getOrCreate()
-    # --- MODIFICADO: Usa {catalog_name} y {config.db} ---
+
     spark.sql(f"CREATE DATABASE IF NOT EXISTS {catalog_name}.{config.db}")
 
     target_fqn = f"{catalog_name}.{config.db}.{name}"
 
-    # 1) Preferente: register_table() con metadata_file
     try:
-        spark.sql(
-            f"""
-            CALL {catalog_name}.system.register_table(
-              namespace => '{config.db}',
-              table => '{name}',
-              metadata_file => '{metadata_file_uri}'
-            )
-            """
-        )
-        log.info(f"[{name}] Registrada por register_table().")
+        log.info(f"[{name}] Intentando cargar (leer) la tabla desde: {table_location}")
+        
+        # 1. Carga la tabla existente desde S3
+        df = spark.read.format("iceberg").load(table_location)
+        
+        log.info(f"[{name}] Tabla leída con éxito. Registrando en catálogo como {target_fqn}...")
+
+        # 2. Guárdala/Regístrala en el catálogo (Hive Metastore)
+        df.write.mode("overwrite").saveAsTable(target_fqn)
+
+        log.info(f"[{name}] ¡Registrada con éxito en el catálogo!")
+
     except Exception as e:
-        log.warning(f"[{name}] register_table() no disponible o falló ({e}). Fallback a CREATE TABLE LOCATION.")
-        spark.sql(
-            f"""
-            CREATE TABLE IF NOT EXISTS {target_fqn}
-            USING ICEBERG
-            LOCATION '{table_location}'
-            """
-        )
-        log.info(f"[{name}] Registrada por CREATE TABLE ... LOCATION.")
+        log.error(f"[{name}] Fallo al intentar cargar y registrar la tabla desde {table_location}. Error: {e}")
+        # Si esto falla, lanzamos el error para ver por qué
+        raise e
 
     # Comprobación rápida
     try:
