@@ -194,7 +194,6 @@ def register_one_table_op(name: str, config: RegisterConfig) -> None:
                     "db": "portesa_uploads",
                     "metastore_uri": "thrift://metastore:9083",
                     "dest_root": "s3://bbtwins-test/Data/portesa/uploads/",
-                    "aws_region": "eu-west-1"
                 }
             }
         }

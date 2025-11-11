@@ -17,19 +17,12 @@
     <value>true</value>
   </property>
 
-  <!-- Opcional: fija región si quieres (si no, la resuelve el SDK) -->
-  <!--
-  <property>
-    <name>fs.s3a.region</name>
-    <value>us-east-1</value>
-  </property>
-  -->
-
   <!-- Mantener las implementaciones S3A (bien tenerlas) -->
   <property>
     <name>fs.s3a.impl</name>
     <value>org.apache.hadoop.fs.s3a.S3AFileSystem</value>
   </property>
+  
   <property>
     <name>fs.AbstractFileSystem.s3a.impl</name>
     <value>org.apache.hadoop.fs.s3a.S3A</value>
