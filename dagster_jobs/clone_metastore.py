@@ -1,21 +1,20 @@
-# dagster_register_existing_warehouses.py
-# Dagster 1.9.x | PySpark 3.3/3.4 con Iceberg + Hadoop-AWS en el runtime.
-
 from urllib.parse import urlparse
 from typing import Optional
-
+import os
 import boto3
 from dagster import op, job, Config, get_dagster_logger, DynamicOut, DynamicOutput, Definitions
 
 # --------------------------
 # Configs
 # --------------------------
+S3_REGION = os.getenv("AWS_REGION")
 
 class ListExistingConfig(Config):
     dest_root: str                 # ej: s3://bbtwins-test/Data/portesa/uploads/
     require_metadata_dir: bool = True
 
 class RegisterConfig(Config):
+    catalog_name: str
     db: str                        # ej: "portesa_uploads"
     metastore_uri: str             # ej: thrift://metastore-test:9083
     dest_root: str                 # igual que en ListExistingConfig (se pasa aquí también)
@@ -40,7 +39,8 @@ def list_existing_tables_op(config: ListExistingConfig):
     if not prefix.endswith("/"):
         prefix += "/"
 
-    s3 = boto3.client("s3")
+    s3 = boto3.client("s3", region_name=S3_REGION)
+
     paginator = s3.get_paginator("list_objects_v2")
     found = False
 
@@ -63,7 +63,14 @@ def list_existing_tables_op(config: ListExistingConfig):
 
             found = True
             log.info(f"Detectada tabla existente: {name}")
-            yield DynamicOutput(name, mapping_key=name)
+            # 1. Reemplazar 'ñ' por 'n' y 'Ñ' por 'N' (como solicitaste)
+            name_normalized = name.replace('ñ', 'n').replace('Ñ', 'N')
+            
+            # 2. Sanitizar el resto de caracteres no alfanuméricos (como '-') a '_'
+            mapping_key = "".join(c if c.isalnum() else '_' for c in name_normalized)
+
+            # Yield the *original* name as the value, but the *sanitized* name as the key
+            yield DynamicOutput(name, mapping_key=mapping_key)
 
     if not found:
         log.warning("No se detectaron subcarpetas de tabla en el prefijo indicado.")
@@ -75,7 +82,7 @@ def list_existing_tables_op(config: ListExistingConfig):
 @op
 def register_one_table_op(name: str, config: RegisterConfig) -> None:
     """
-    Registra en Hive Metastore (catálogo 'ice_test') la tabla existente en S3,
+    Registra en Hive Metastore (catálogo 'iceberg') la tabla existente en S3,
     sin reescribir datos: usa register_table() apuntando al último v*.metadata.json.
     Si no está disponible, hace fallback a CREATE TABLE ... USING ICEBERG LOCATION ...
     """
@@ -88,7 +95,7 @@ def register_one_table_op(name: str, config: RegisterConfig) -> None:
     bucket = parsed.netloc
     base = parsed.path.lstrip("/")
 
-    s3 = boto3.client("s3")
+    s3 = boto3.client("s3", region_name=S3_REGION)
 
     # Localiza carpeta de metadatos (metadata/ o _iceberg/metadata/)
     meta_dir = f"{base}metadata/"
@@ -105,7 +112,7 @@ def register_one_table_op(name: str, config: RegisterConfig) -> None:
     else:
         raise ValueError(f"[{name}] No se encontró carpeta de metadatos en s3://{bucket}/{base}")
 
-    # Busca el último v*.metadata.json
+    # Busca el último .metadata.json
     paginator = s3.get_paginator("list_objects_v2")
     latest_meta = None
     latest_ts = None
@@ -113,41 +120,47 @@ def register_one_table_op(name: str, config: RegisterConfig) -> None:
         for obj in page.get("Contents", []):
             key = obj["Key"]
             fname = key.split("/")[-1]
-            if fname.startswith("v") and fname.endswith(".metadata.json"):
+            if fname.endswith(".metadata.json"):
                 ts = obj["LastModified"]
                 if latest_ts is None or ts > latest_ts:
                     latest_ts = ts
                     latest_meta = key
 
     if not latest_meta:
-        raise ValueError(f"[{name}] No se encontró ningún v*.metadata.json en {md_prefix}")
+        log.warning(f"[{name}] No se encontró ningún .metadata.json en {md_prefix}. Omitiendo esta tabla.")
+        return # Salta esta tabla y continúa con la siguiente
 
     metadata_file_uri = f"s3://{bucket}/{latest_meta}"
     table_location = f"s3://{bucket}/{base}"
 
     # Spark para registrar en el catálogo Iceberg (Hive)
     from pyspark.sql import SparkSession
+    
+    # --- Usa el nombre del catálogo dinámicamente ---
+    catalog_name = config.catalog_name
+    
     builder = (
         SparkSession.builder
         .appName(f"register-{name}")
-        .config("spark.sql.catalog.ice_test", "org.apache.iceberg.spark.SparkCatalog")
-        .config("spark.sql.catalog.ice_test.type", "hive")
-        .config("spark.sql.catalog.ice_test.uri", config.metastore_uri)
+        .config(f"spark.sql.catalog.{catalog_name}", "org.apache.iceberg.spark.SparkCatalog")
+        .config(f"spark.sql.catalog.{catalog_name}.type", "hive")
+        .config(f"spark.sql.catalog.{catalog_name}.uri", config.metastore_uri)
         .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
     )
     if config.aws_region:
         builder = builder.config("spark.hadoop.aws.region", config.aws_region)
 
     spark = builder.getOrCreate()
-    spark.sql(f"CREATE DATABASE IF NOT EXISTS ice_test.{config.db}")
+    # --- MODIFICADO: Usa {catalog_name} y {config.db} ---
+    spark.sql(f"CREATE DATABASE IF NOT EXISTS {catalog_name}.{config.db}")
 
-    target_fqn = f"ice_test.{config.db}.{name}"
+    target_fqn = f"{catalog_name}.{config.db}.{name}"
 
     # 1) Preferente: register_table() con metadata_file
     try:
         spark.sql(
             f"""
-            CALL ice_test.system.register_table(
+            CALL {catalog_name}.system.register_table(
               namespace => '{config.db}',
               table => '{name}',
               metadata_file => '{metadata_file_uri}'
@@ -191,7 +204,8 @@ def register_one_table_op(name: str, config: RegisterConfig) -> None:
             },
             "register_one_table_op": {
                 "config": {
-                    "db": "portesa_uploads",
+                    "catalog_name": "portesa",
+                    "db": "uploads",
                     "metastore_uri": "thrift://metastore:9083",
                     "dest_root": "s3://bbtwins-test/Data/portesa/uploads/",
                 }
